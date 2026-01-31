@@ -2878,7 +2878,7 @@ class NotificationService:
         from pathlib import Path
         
         if filename is None:
-            date_str = datetime.now().strftime('%Y%m%d')
+            date_str = datetime.now().strftime('%Y%m%d%H%M%S')
             filename = f"report_{date_str}.md"
         
         # 确保 reports 目录存在（使用项目根目录下的 reports）

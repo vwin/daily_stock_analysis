@@ -12,7 +12,7 @@
 
 技术标准：
 - 多头排列：MA5 > MA10 > MA20
-- 乖离率：(Close - MA5) / MA5 < 5%（不追高）
+- 乖离率：(Close - MA5) / MA5 < 7%（不追高）
 - 量能形态：缩量回调优先
 """
 
@@ -180,7 +180,7 @@ class StockTrendAnalyzer:
     """
     
     # 交易参数配置
-    BIAS_THRESHOLD = 5.0        # 乖离率阈值（%），超过此值不买入
+    BIAS_THRESHOLD = 7.0        # 乖离率阈值（%），超过此值不买入
     VOLUME_SHRINK_RATIO = 0.7   # 缩量判断阈值（当日量/5日均量）
     VOLUME_HEAVY_RATIO = 1.5    # 放量判断阈值
     MA_SUPPORT_TOLERANCE = 0.02  # MA 支撑判断容忍度（2%）
@@ -394,7 +394,7 @@ class StockTrendAnalyzer:
         
         乖离率 = (现价 - 均线) / 均线 * 100%
         
-        严进策略：乖离率超过 5% 不追高
+        严进策略：乖离率超过 7% 不追高
         """
         price = result.current_price
         
