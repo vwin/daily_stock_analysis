@@ -12,17 +12,20 @@
 
 技术标准：
 - 多头排列：MA5 > MA10 > MA20
-- 乖离率：(Close - MA5) / MA5 < 7%（不追高）
+- 乖离率：(Close - MA5) / MA5 < 5%（不追高）
 - 量能形态：缩量回调优先
 """
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Dict, Any, List
 from enum import Enum
 
 import pandas as pd
 import numpy as np
+
+from src.config import get_config
+from src.schemas.decision_scale import signal_key_for_score
 
 logger = logging.getLogger(__name__)
 
@@ -179,8 +182,7 @@ class StockTrendAnalyzer:
     6. RSI 指标 - 超买超卖判断
     """
     
-    # 交易参数配置
-    BIAS_THRESHOLD = 7.0        # 乖离率阈值（%），超过此值不买入
+    # 交易参数配置（BIAS_THRESHOLD 从 Config 读取，见 _generate_signal）
     VOLUME_SHRINK_RATIO = 0.7   # 缩量判断阈值（当日量/5日均量）
     VOLUME_HEAVY_RATIO = 1.5    # 放量判断阈值
     MA_SUPPORT_TOLERANCE = 0.02  # MA 支撑判断容忍度（2%）
@@ -302,10 +304,11 @@ class StockTrendAnalyzer:
 
     def _calculate_rsi(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        计算 RSI 指标
+        计算 RSI 指标（Wilder's EMA / SMMA 口径）
 
         公式：
-        - RS = 平均上涨幅度 / 平均下跌幅度
+        - avg_gain / avg_loss 使用 ewm(alpha=1/period, adjust=False)
+        - RS = avg_gain / avg_loss
         - RSI = 100 - (100 / (1 + RS))
         """
         df = df.copy()
@@ -318,9 +321,9 @@ class StockTrendAnalyzer:
             gain = delta.where(delta > 0, 0)
             loss = -delta.where(delta < 0, 0)
 
-            # 计算平均涨跌幅
-            avg_gain = gain.rolling(window=period).mean()
-            avg_loss = loss.rolling(window=period).mean()
+            # 使用 Wilder's EMA / SMMA 口径，与常见 RSI 图表工具保持一致。
+            avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+            avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
 
             # 计算 RS 和 RSI
             rs = avg_gain / avg_loss
@@ -394,7 +397,7 @@ class StockTrendAnalyzer:
         
         乖离率 = (现价 - 均线) / 均线 * 100%
         
-        严进策略：乖离率超过 7% 不追高
+        严进策略：乖离率超过 5% 不追高
         """
         price = result.current_price
         
@@ -613,10 +616,23 @@ class StockTrendAnalyzer:
         elif result.trend_status in [TrendStatus.BEAR, TrendStatus.STRONG_BEAR]:
             risks.append(f"⚠️ {result.trend_status.value}，不宜做多")
 
-        # === 乖离率评分（20分）===
+        # === 乖离率评分（20分，强势趋势补偿）===
         bias = result.bias_ma5
+        if bias != bias or bias is None:  # NaN or None defense
+            bias = 0.0
+        base_threshold = get_config().bias_threshold
+
+        # Strong trend compensation: relax threshold for STRONG_BULL with high strength
+        trend_strength = result.trend_strength if result.trend_strength == result.trend_strength else 0.0
+        if result.trend_status == TrendStatus.STRONG_BULL and (trend_strength or 0) >= 70:
+            effective_threshold = base_threshold * 1.5
+            is_strong_trend = True
+        else:
+            effective_threshold = base_threshold
+            is_strong_trend = False
+
         if bias < 0:
-            # 价格在 MA5 下方（回调中）
+            # Price below MA5 (pullback)
             if bias > -3:
                 score += 20
                 reasons.append(f"✅ 价格略低于MA5({bias:.1f}%)，回踩买点")
@@ -629,12 +645,24 @@ class StockTrendAnalyzer:
         elif bias < 2:
             score += 18
             reasons.append(f"✅ 价格贴近MA5({bias:.1f}%)，介入好时机")
-        elif bias < self.BIAS_THRESHOLD:
+        elif bias < base_threshold:
             score += 14
             reasons.append(f"⚡ 价格略高于MA5({bias:.1f}%)，可小仓介入")
+        elif bias > effective_threshold:
+            score += 4
+            risks.append(
+                f"❌ 乖离率过高({bias:.1f}%>{effective_threshold:.1f}%)，严禁追高！"
+            )
+        elif bias > base_threshold and is_strong_trend:
+            score += 10
+            reasons.append(
+                f"⚡ 强势趋势中乖离率偏高({bias:.1f}%)，可轻仓追踪"
+            )
         else:
             score += 4
-            risks.append(f"❌ 乖离率过高({bias:.1f}%>5%)，严禁追高！")
+            risks.append(
+                f"❌ 乖离率过高({bias:.1f}%>{base_threshold:.1f}%)，严禁追高！"
+            )
 
         # === 量能评分（15分）===
         volume_scores = {
@@ -703,16 +731,24 @@ class StockTrendAnalyzer:
         result.signal_reasons = reasons
         result.risk_factors = risks
 
-        # 生成买入信号（调整阈值以适应新的100分制）
-        if score >= 75 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
+        # 生成买入信号（与 canonical decision scale 保持一致）
+        score_signal = signal_key_for_score(score)
+        if score_signal == "strong_buy" and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
             result.buy_signal = BuySignal.STRONG_BUY
-        elif score >= 60 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL, TrendStatus.WEAK_BULL]:
+        elif score_signal in {"strong_buy", "buy"} and result.trend_status in [
+            TrendStatus.STRONG_BULL,
+            TrendStatus.BULL,
+            TrendStatus.WEAK_BULL,
+        ]:
             result.buy_signal = BuySignal.BUY
-        elif score >= 45:
-            result.buy_signal = BuySignal.HOLD
-        elif score >= 30:
+        elif score_signal in {"strong_buy", "buy"} and result.trend_status in [
+            TrendStatus.CONSOLIDATION,
+            TrendStatus.WEAK_BEAR,
+        ]:
             result.buy_signal = BuySignal.WAIT
-        elif result.trend_status in [TrendStatus.BEAR, TrendStatus.STRONG_BEAR]:
+        elif score_signal == "watch":
+            result.buy_signal = BuySignal.WAIT
+        elif score_signal == "sell" or result.trend_status in [TrendStatus.BEAR, TrendStatus.STRONG_BEAR]:
             result.buy_signal = BuySignal.STRONG_SELL
         else:
             result.buy_signal = BuySignal.SELL
